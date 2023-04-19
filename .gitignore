@@ -1,0 +1,4 @@
+../pico-sdk/
+/build/
+*.cmake
+/.vscode/.cortex*

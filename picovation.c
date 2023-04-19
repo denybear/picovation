@@ -63,7 +63,8 @@ const uint NO_LED2_GPIO = 255;
 
 // globals
 static uint8_t song = 0;
-
+static uint8_t midi_dev_addr = 0;
+bool play = false;
 
 // test switches and return which switch has been pressed (FALSE if none)
 int test_switch (int pedal_to_check)
@@ -111,7 +112,7 @@ static void send_midi (bool connected, uint8_t * buffer, uint32_t lg)
     {
         nwritten = tuh_midi_stream_write(midi_dev_addr, 0, buffer, lg);
         if (nwritten != lg) {
-            TU_LOG1("Warning: Dropped %d byte\r\n", (lg-nwritten));
+            TU_LOG1("Warning: Dropped %ld byte\r\n", (lg-nwritten));
         }
     }
 }
@@ -130,12 +131,11 @@ static void poll_usb_rx(bool connected)
 
 int main() {
     
-    bool connected;
-	static uint8_t midi_dev_addr = 0;
+  bool connected;
+  static uint8_t midi_dev_addr = 0;
 	int pedal;
 	uint8_t data [3];	// midi data to send
-	bool play = false;
-
+	
     board_init();
     printf("Picovation\r\n");
     tusb_init();
@@ -272,7 +272,7 @@ void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 					}
 					if (bytes_read == 2){		// test MIDI PROGRAM CHANGE
 						if (buffer [0] == MIDI_PRG_CHANGE)
-							if (buffer [1] =< 31) song = buffer [1];		// make sure song number is inside boudaries (0 to 31)
+							if (buffer [1] <= 31) song = buffer [1];		// make sure song number is inside boudaries (0 to 31)
 					}
                 }
             }
