@@ -39,20 +39,20 @@
 #define MIDI_PRG_CHANGE 0xCF	// 0xC0 is program change, 0x0F is midi channel
 
 #define LED_GPIO	25	// onboard led
-#define LED2_GPIO	21	// 2nd led
+#define LED2_GPIO	255	// 2nd led
 const uint NO_LED_GPIO = 255;
 const uint NO_LED2_GPIO = 255;
 
-#define SWITCH_1	16
-#define SWITCH_2	17
-#define SWITCH_3	18
-#define SWITCH_4	19
-#define SWITCH_5	20
+#define SWITCH_1	11
+#define SWITCH_2	12
+#define SWITCH_3	13
+#define SWITCH_4	14
+#define SWITCH_5	15
 
-#define SWITCH_PREV		16		// previous session
-#define SWITCH_NEXT		17		// next session
-#define SWITCH_PLAY		18		// play
-#define SWITCH_PAUSE	19		// pause
+#define SWITCH_PREV		11		// previous session
+#define SWITCH_NEXT		15		// next session
+#define SWITCH_PLAY		12		// play
+#define SWITCH_PAUSE	14		// pause
 #define PREV			1
 #define NEXT			2
 #define PLAY			4
