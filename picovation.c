@@ -97,7 +97,10 @@ int test_switch (int pedal_to_check)
 		return result;
 	}
 
-    return FALSE;
+  // no switch pressed : LED off
+  if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, false);		// if onboard led and if we are within time window, lite LED on
+  if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, false);	// if another led and if we are within time window, lite LED on
+  return FALSE;
 }
 
 
@@ -136,40 +139,47 @@ int main() {
 	int pedal;
 	uint8_t data [3];	// midi data to send
 	
-    board_init();
-    printf("Picovation\r\n");
-    tusb_init();
+  board_init();
+  printf("Picovation\r\n");
+  tusb_init();
 
-    // Map the pins to functions
-    gpio_init(LED_GPIO);
-    gpio_set_dir(LED_GPIO, GPIO_OUT);
-    gpio_init(LED2_GPIO);
-    gpio_set_dir(LED2_GPIO, GPIO_OUT);
-    gpio_init(SWITCH_PREV);
-    gpio_set_dir(SWITCH_PREV, GPIO_IN);
-    gpio_pull_up (SWITCH_PREV);       // switch pull-up
-    gpio_init(SWITCH_NEXT);
-    gpio_set_dir(SWITCH_NEXT, GPIO_IN);
-    gpio_pull_up (SWITCH_NEXT);       // switch pull-up
-    gpio_init(SWITCH_PREV);
-    gpio_set_dir(SWITCH_PLAY, GPIO_IN);
-    gpio_pull_up (SWITCH_PLAY);       // switch pull-up
-    gpio_init(SWITCH_PLAY);
-    gpio_set_dir(SWITCH_PAUSE, GPIO_IN);
-    gpio_pull_up (SWITCH_PAUSE);       // switch pull-up
+  // Map the pins to functions
+  gpio_init(LED_GPIO);
+  gpio_set_dir(LED_GPIO, GPIO_OUT);
+
+  gpio_init(LED2_GPIO);
+  gpio_set_dir(LED2_GPIO, GPIO_OUT);
+
+  gpio_init(SWITCH_PREV);
+  gpio_set_dir(SWITCH_PREV, GPIO_IN);
+  gpio_pull_up (SWITCH_PREV);       // switch pull-up
+
+  gpio_init(SWITCH_NEXT);
+  gpio_set_dir(SWITCH_NEXT, GPIO_IN);
+  gpio_pull_up (SWITCH_NEXT);       // switch pull-up
+
+  gpio_init(SWITCH_PLAY);
+  gpio_set_dir(SWITCH_PLAY, GPIO_IN);
+  gpio_pull_up (SWITCH_PLAY);       // switch pull-up
+
+  gpio_init(SWITCH_PAUSE);
+  gpio_set_dir(SWITCH_PAUSE, GPIO_IN);
+  gpio_pull_up (SWITCH_PAUSE);       // switch pull-up
 
 
-    // main loop
-    while (1) {
-        
-        tuh_task();
-        // check connection to USB slave
-        connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
+  // main loop
+  while (1) {
 
-		// test pedal and check if one of them is pressed
-        pedal = test_switch (PREV | NEXT | PLAY | PAUSE);
+    tuh_task();
+    // check connection to USB slave
+    bool zob = tuh_midi_configured(midi_dev_addr);
+    connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
+
+	 // test pedal and check if one of them is pressed
+    pedal = test_switch (PREV | NEXT | PLAY | PAUSE);
 
 		if (pedal & (NEXT | PREV)) {
+printf ("pedal %d\n",pedal);
 			// previous or next session
 			if (pedal & NEXT)
 				song = (song == 31) ? 0 : song + 1;		// test boundaries
@@ -205,14 +215,14 @@ int main() {
 				tuh_midi_stream_flush(midi_dev_addr);
 			// wait for pedal to be unpressed
 			while (test_switch (PREV | NEXT | PLAY | PAUSE));
-			// when unpressed, wait 50ms to avoid bouncing
-			sleep_ms (50);
+			// when unpressed, wait 100ms to avoid bouncing
+			sleep_ms (100);
 		}
 		
 		// read MIDI events coming from groovebox and manage accordingly
 		poll_usb_rx (connected);
 		
-    }
+  }
 }
 
 

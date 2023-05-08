@@ -2,6 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "showDevDebugOutput": "raw",
             "name": "Pico Debug",
             "cwd": "${workspaceRoot}",
             "executable": "${command:cmake.launchTargetPath}",
