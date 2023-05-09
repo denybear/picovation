@@ -25,6 +25,18 @@
  * SOFTWARE.
  * 
  */
+
+// Groovebox shall be setup with (press shift while powering the Novation circuit) :
+// notes RX and TX : off
+// CC RX and TX : off
+// PC RX and TX : on
+// Clock RX : on, Clock TX : off
+// Lights on the Novation circuit : 00 00 11 10
+//
+// receiving clock signal is too resource-consuming for raspi pico
+// START / STOP don't work if raspi does not provide clock signal
+
+
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
@@ -64,7 +76,7 @@ const uint NO_LED2_GPIO = 255;
 // globals
 static uint8_t song = 0;
 static uint8_t midi_dev_addr = 0;
-bool play = false;
+static bool play = false;
 
 // test switches and return which switch has been pressed (FALSE if none)
 int test_switch (int pedal_to_check)
@@ -75,25 +87,27 @@ int test_switch (int pedal_to_check)
     // test if switch has been pressed
     // in this case, line is down (level 0)
     if ((pedal_to_check & PREV) && gpio_get (SWITCH_PREV)==0) {
-		result |= PREV;
+		  result |= PREV;
     }
 
     if ((pedal_to_check & NEXT) && gpio_get (SWITCH_NEXT)==0) {
-		result |= NEXT;
+		  result |= NEXT;
     }
 
     if ((pedal_to_check & PLAY) && gpio_get (SWITCH_PLAY)==0) {
-		result |= PLAY;
+		  result |= PLAY;
     }
 
     if ((pedal_to_check & PAUSE) && gpio_get (SWITCH_PAUSE)==0) {
-		result |= PAUSE;
+		  result |= PAUSE;
     }
 
 	// LED ON if a switch has been pressed
 	if (result) {
-        if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, true);		// if onboard led and if we are within time window, lite LED on
-        if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, true);	// if another led and if we are within time window, lite LED on
+    if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, true);		// if onboard led and if we are within time window, lite LED on
+    if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, true);	// if another led and if we are within time window, lite LED on
+    // anti-bounce of 30ms
+		sleep_ms (30);
 		return result;
 	}
 
@@ -109,8 +123,6 @@ static void send_midi (bool connected, uint8_t * buffer, uint32_t lg)
 {
     uint32_t nwritten;
 
-    // set buffer with midi clock
-   
     if (connected && tuh_midih_get_num_tx_cables(midi_dev_addr) >= 1)
     {
         nwritten = tuh_midi_stream_write(midi_dev_addr, 0, buffer, lg);
@@ -135,7 +147,6 @@ static void poll_usb_rx(bool connected)
 int main() {
     
   bool connected;
-  static uint8_t midi_dev_addr = 0;
 	int pedal;
 	uint8_t data [3];	// midi data to send
 	
@@ -172,14 +183,12 @@ int main() {
 
     tuh_task();
     // check connection to USB slave
-    bool zob = tuh_midi_configured(midi_dev_addr);
     connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
 
-	 // test pedal and check if one of them is pressed
+	  // test pedal and check if one of them is pressed
     pedal = test_switch (PREV | NEXT | PLAY | PAUSE);
 
 		if (pedal & (NEXT | PREV)) {
-printf ("pedal %d\n",pedal);
 			// previous or next session
 			if (pedal & NEXT)
 				song = (song == 31) ? 0 : song + 1;		// test boundaries
@@ -211,15 +220,17 @@ printf ("pedal %d\n",pedal);
 
 		if (pedal) {
 			// if pedal is pressed, then flush send buffer
-			if (connected)
-				tuh_midi_stream_flush(midi_dev_addr);
-			// wait for pedal to be unpressed
-			while (test_switch (PREV | NEXT | PLAY | PAUSE));
-			// when unpressed, wait 100ms to avoid bouncing
-			sleep_ms (100);
+			if (connected) tuh_midi_stream_flush(midi_dev_addr);
+			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
+			while (test_switch (PREV | NEXT | PLAY | PAUSE)) {
+    		// read MIDI events coming from groovebox and manage accordingly
+        // commented as this may not be necessary
+        // poll_usb_rx (connected);
+      }
 		}
 		
-		// read MIDI events coming from groovebox and manage accordingly
+		// flush outgoing data, and read MIDI events coming from groovebox and manage accordingly
+		if (connected) tuh_midi_stream_flush(midi_dev_addr);
 		poll_usb_rx (connected);
 		
   }
@@ -244,6 +255,7 @@ void tuh_midi_mount_cb(uint8_t dev_addr, uint8_t in_ep, uint8_t out_ep, uint8_t 
     // then no MIDI device is currently connected
     midi_dev_addr = dev_addr;
   }
+
   else {
     printf("A different USB MIDI Device is already connected.\r\nOnly one device at a time is supported in this program\r\nDevice is disabled\r\n");
   }
@@ -264,26 +276,28 @@ void tuh_midi_umount_cb(uint8_t dev_addr, uint8_t instance)
 // invoked when receiving some MIDI data
 void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 {
-
     if (midi_dev_addr == dev_addr)
     {
         if (num_packets != 0)
         {
             uint8_t cable_num;
-            uint8_t buffer[48];
+            uint8_t buffer[48];   // 48 should be enough as we only get Program Change data
             while (1) {
                 uint32_t bytes_read = tuh_midi_stream_read(dev_addr, &cable_num, buffer, sizeof(buffer));
                 if (bytes_read == 0) return;
                 if (cable_num == 0) {
-					// test values received from groovebox via MIDI
-					if (bytes_read == 1){		// test MIDI PLAY or STOP
-						if (buffer [0] == MIDI_PLAY) play = true;
-						if (buffer [0] == MIDI_STOP) play = false;
-					}
-					if (bytes_read == 2){		// test MIDI PROGRAM CHANGE
-						if (buffer [0] == MIDI_PRG_CHANGE)
-							if (buffer [1] <= 31) song = buffer [1];		// make sure song number is inside boudaries (0 to 31)
-					}
+					        // test values received from groovebox via MIDI
+                  // this is a poor way of testing; in some cases, we receive much more than 1 or 2 bytes
+                  // and incoming MIDI message should be parsed
+                  // in the case we only receive Program Change data, this testing should be sufficient
+					        if (bytes_read == 1) {		// test MIDI PLAY or STOP
+						        if (buffer [0] == MIDI_PLAY) play = true;
+						        if (buffer [0] == MIDI_STOP) play = false;
+					        }
+					      if (bytes_read == 2) {		// test MIDI PROGRAM CHANGE
+						      if (buffer [0] == MIDI_PRG_CHANGE)
+							      if (buffer [1] <= 31) song = buffer [1];		// make sure song number is inside boudaries (0 to 31)
+					      }
                 }
             }
         }
