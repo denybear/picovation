@@ -75,13 +75,22 @@ const uint NO_LED2_GPIO = 255;
 #define FALSE			0
 #define TRUE 			1
 
-#define EXIT_FUNCTION	3000	// 3000 msec = 3 sec
+#define EXIT_FUNCTION	3000000	// 3000000 usec = 3 sec
 #define NB_TICKS		24		// 24 ticks per beat (quarter note)
+#define	40BPM_TICKS		62500	// 40BPM = 1 beat every 1.5 seconds = 1500000 usec / NB_TICKS = 62500 us between ticks
+#define	240BPM_TICKS	10417	// 240BPM = 1 beat every .250 seconds = 250000 usec / NB_TICKS = 10417 us between ticks
+
+// type for alarm IRQ handling
+struct usr_data {
+	bool connected;
+	int64_t time;
+};
 
 // globals
 static uint8_t song = 0;
 static uint8_t midi_dev_addr = 0;
 static bool play = false;
+
 
 // test switches and return which switch has been pressed (FALSE if none)
 int test_switch (int pedal_to_check)
@@ -143,7 +152,7 @@ static void send_midi (bool connected, uint8_t * buffer, uint32_t lg)
 
 
 // poll USB receive and process received bytes accordingly
-static void poll_usb_rx(bool connected)
+static void poll_usb_rx (bool connected)
 {
 	// device must be attached and have at least one endpoint ready to receive a message
 	if (!connected || tuh_midih_get_num_rx_cables(midi_dev_addr) < 1)
@@ -155,28 +164,39 @@ static void poll_usb_rx(bool connected)
 
 
 // called at regular time (alert); this is used to send MIDI clock signal at regular intervals (tap tempo functionality) 
-// shall return >0 to reschedule the same alarm this many us from the time this method returns
-int64_t alarm_callback (alarm_id_t id, void *user_data)
+// shall return <0 to reschedule the same alarm this many us from the time the alarm was previously scheduled to fire
+int64_t alarm_callback (alarm_id_t id, void *alarm_data)
 {
+	int64_t time_interval;
+	bool connected;
+	uint8_t data [3];	// midi data to send
 
-// HERE: SEND MIDI CLOCK
-	printf("Timer %d fired!\n", (int) id);
-	timer_fired = true;
-	// Can return a value here in us to fire in the future
-	return 0;
+	// get values from alarm data structure
+	connected = (struct usr_data*) alarm_data->connected;
+	time_interval = -((struct usr_data*) alarm_data->time);		// must be negative
+	
+	// send MIDI CLOCK signal
+	data [0] = MIDI_CLOCK;
+	send_midi (connected, data, 1);
+
+	// flush outgoing data
+	if (connected) tuh_midi_stream_flush(midi_dev_addr);
+
+	return time_interval;
 }
 
 
 int main() {
 	
-	bool connected;
 	int pedal;
 	uint8_t data [3];	// midi data to send
+	bool connected;
 
-	bool tempo = false;					// indicates whether tempo functionality is on or off
-	uint32_t press_on, press_off;		// time for tap tempo function, to enable / disable tap tempo functionality
-	uint32_t this_press, previous_press;		// time for tap tempo function, to measure timing between 1st and 2nd press
+	uint64_t press_on, press_off;				// time for tap tempo function, to enable / disable tap tempo functionality
+	uint64_t this_press, previous_press = 0;	// time for tap tempo function, to measure timing between 1st and 2nd press
+	int64_t time_interval_between_ticks;		// time to wait between 2 MIDI clock ticks
 	alarm_id_t alarm_id;						// id of alarm used to send MIDI clock at regular intervals
+	struct usr_data alarm_data;					// data struct to be passed to alarm callback
 
 
 	stdio_init_all();
@@ -256,34 +276,30 @@ int main() {
 			// Tap tempo functionality
 			
 			// get current time
-			this_press = to_ms_since_boot (get_absolute_time());
+			this_press = to_us_since_boot (get_absolute_time());
 			press_on = this_press;
 
-			// In case this is the first time we press the tempo pedal
-			if (!tempo) {
-				// set key variables and do nothing
-				tempo = true;
-				previous_press = this_press;
+			// In case this is the first time we press the tempo pedal, then previous_press will be 0
+			// otherwise previous_press will have another value
+
+			// calculate time difference between 2 press of tap tempo pedal, and from this calculate corresponding interval between MIDI ticks
+			time_interval_between_ticks = (this_press - previous_press) / NB_TICKS;
+			// in case time between ticks is too short, do not take press into account: do not change alarms, and consider this is the first press of pedal
+			// in case time between ticks is too large, do not take press into account: do not change alarms, and consider this is the first press of pedal
+
+			// in case there have been 2 presses within the correct timing boundaries
+			if (time_interval_between_ticks <= 40BPM_TICKS) && (time_interval_between_ticks >= 240BPM_TICKS) {
+				// remove current alarm; will do nothing if no alarm exist already
+				cancel_alarm (alarm_id);
+				// set a new alarm to send MIDI clock for each MIDI tick
+				alarm_data.connected = connected;
+				alarm_data.time = time_interval_between_ticks;
+				alarm_id = add_alarm_in_us (0, alarm_callback, (void *) &alarm_data, true);
+				// if above does not work, try: alarm_id = add_alarm_in_us (time_interval_between_ticks, alarm_callback, (void *) &alarm_data, true);
 			}
-			// this is not the first time we press the tempo pedal
-			else {
-// HERE 
-				// calculate time difference
-				// in case time difference is too short, do not take into account: do not change alarms, and consider this is the first press of pedal
-				// in case time difference is too large, do not take into account: do not change alarms, and consider this is the first press of pedal
-					// else
-					// calculate interval between MIDI ticks
-					// set alarm to send MIDI clock for each MIDI tick
 
-// HERE: SET ALARM
-// Call alarm_callback in 2 seconds
-alarm_id = add_alarm_in_ms(2000, alarm_callback, NULL, false);
-
-
-
-				// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
-				previous_press = this_press;
-			}
+			// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
+			previous_press = this_press;
 
 			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
 			while (test_switch (PREV | NEXT | PLAY | PAUSE | TEMPO)) {
@@ -291,20 +307,22 @@ alarm_id = add_alarm_in_ms(2000, alarm_callback, NULL, false);
 				// commented as this may not be necessary
 				// poll_usb_rx (connected);
 			}
+			// here we could set pedal to 0 as we know no pedal is pressed; however it does not hurt to keep it though
 
 			// if the pedal has been pressed for 3+ seconds, then disable tap tempo functionality
 			// get current time
-			press_off = to_ms_since_boot (get_absolute_time());
+			press_off = to_us_since_boot (get_absolute_time());
 			// check whether pedal has been pressed for 3+ seconds in which case we disable the function
-			if (press_off - press_on > EXIT_FUNCTION) {
+			if (press_off - press_on >= EXIT_FUNCTION) {
 				// remove alarm
 				cancel_alarm (alarm_id);
-				// set functionality off
-				tempo = false;
+				// set functionality off (this is not really necessary)
+				previous_press = 0;
 			}
 		}
 
 
+		// check that pedal is released
 		if (pedal) {
 			// if pedal is pressed, then flush send buffer
 			if (connected) tuh_midi_stream_flush(midi_dev_addr);
