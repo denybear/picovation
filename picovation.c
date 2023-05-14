@@ -44,10 +44,6 @@
 #include "tusb.h"
 
 // constants
-//#define ALARM
-#define ALARM2
-//#define NOALARM
-
 #define MIDI_CLOCK		0xF8
 #define MIDI_PLAY		0xFA
 #define MIDI_STOP		0xFC
@@ -74,15 +70,9 @@ const uint NO_LED2_GPIO = 255;
 #define NEXT			2
 #define PLAY			4
 #define PAUSE			8
-#define TEMPO			16
 
 #define FALSE			0
 #define TRUE 			1
-
-#define EXIT_FUNCTION	2000000	// 2000000 usec = 2 sec
-#define NB_TICKS		24		// 24 ticks per beat (quarter note)
-#define	BPM40_TICKS		62500	// 40BPM = 1 beat every 1.5 seconds = 1500000 usec / NB_TICKS = 62500 us between ticks
-#define	BPM240_TICKS	10417	// 240BPM = 1 beat every .250 seconds = 250000 usec / NB_TICKS = 10417 us between ticks
 
 
 // globals
@@ -90,16 +80,11 @@ static uint8_t song = 0;
 static uint8_t midi_dev_addr = 0;
 static bool connected = false;
 static bool play = false;
-static int64_t time_interval_between_ticks = 42000;			// time to wait between 2 MIDI clock ticks; initialized to 1 sec/24 (60BPM)
 
-#ifdef ALARM2
-static bool midi_clock_to_send = false;		// true if midi clock should be sent
-#endif
-
-#ifdef NOALARM
-static uint64_t time_to_send_next_clock = 0xffffffffffffffff;	// time when to sent next midi clock; initialized to end of times
-#endif
-
+#define MIDI_BUF_SIZE	5000
+static uint8_t midi_rx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
+static uint8_t midi_tx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
+static int index_tx = 0;
 
 // poll USB receive and process received bytes accordingly
 void poll_usb_rx ()
@@ -128,54 +113,10 @@ void send_midi (uint8_t * buffer, uint32_t lg)
 }
 
 
-#ifdef ALARM2
-// sends a midi clock signal
-bool send_clock ()
-{
-	uint8_t data;
-
-	// send MIDI CLOCK signal
-	data = MIDI_CLOCK;
-	send_midi (&data, 1);
-	midi_clock_to_send = false;
-
-	// flush outgoing data
-	if (connected) tuh_midi_stream_flush(midi_dev_addr);
-
-	return true;
-}
-#endif
-
-
-#ifdef NOALARM
-// sends a midi clock signal when "when_to_send" time has elapsed, and returns true
-// returns false if not elapsed
-bool send_clock (uint64_t when_to_send)
-{
-	uint64_t time;
-	uint8_t data;
-
-	// check whether it is time to send midi clock signal or not
-	time = to_us_since_boot (get_absolute_time());
-	if (time < when_to_send) return false;
-
-	// send MIDI CLOCK signal
-	data = MIDI_CLOCK;
-	send_midi (&data, 1);
-
-	// flush outgoing data
-	if (connected) tuh_midi_stream_flush(midi_dev_addr);
-	return true;
-}
-#endif
-
-
 // test switches and return which switch has been pressed (FALSE if none)
 int test_switch (int pedal_to_check)
 {
 	int result = 0;
-	int i;
-	
 	
 	// test if switch has been pressed
 	// in this case, line is down (level 0)
@@ -195,32 +136,13 @@ int test_switch (int pedal_to_check)
 		result |= PAUSE;
 	}
 
-	if ((pedal_to_check & TEMPO) && gpio_get (SWITCH_TEMPO)==0) {
-		result |= TEMPO;
-	}
 
 	// LED ON if a switch has been pressed
 	if (result) {
 		if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, true);		// if onboard led and if we are within time window, lite LED on
 		if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, true);	// if another led and if we are within time window, lite LED on
 		// anti-bounce of 30ms
-#ifdef ALARM
 		sleep_ms (30);
-#endif
-
-#ifdef ALARM2
-		for (i = 0; i < 30; i++) {
-			sleep_ms (1);
-			if (midi_clock_to_send) send_clock ();
-		}
-#endif
-
-#ifdef NOALARM
-		for (i = 0; i < 30; i++) {
-			sleep_ms (1);
-			if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = to_us_since_boot (get_absolute_time()) + time_interval_between_ticks;
-		}
-#endif
 		return result;
 	}
 
@@ -231,53 +153,9 @@ int test_switch (int pedal_to_check)
 }
 
 
-#ifdef ALARM
-// called at regular time (alert); this is used to send MIDI clock signal at regular intervals (tap tempo functionality) 
-// shall return <0 to reschedule the same alarm this many us from the time the alarm was previously scheduled to fire
-int64_t alarm_callback (alarm_id_t id, void *alarm_data)
-{
-	uint8_t data [3];	// midi data to send
-
-	// send MIDI CLOCK signal
-	data [0] = MIDI_CLOCK;
-	send_midi (data, 1);
-
-	// flush outgoing data
-	if (connected) tuh_midi_stream_flush(midi_dev_addr);
-
-	// return next time interval to wait before triggering alarm again
-	return time_interval_between_ticks;
-}
-#endif
-
-
-#ifdef ALARM2
-// called at regular time (alert); this is used to send MIDI clock signal at regular intervals (tap tempo functionality) 
-// shall return <0 to reschedule the same alarm this many us from the time the alarm was previously scheduled to fire
-int64_t alarm_callback (alarm_id_t id, void *alarm_data)
-{
-	// force sending of midi clock signal when going out of this function
-	midi_clock_to_send = true;
-
-	// return next time interval to wait before triggering alarm again
-	return time_interval_between_ticks;
-}
-#endif
-
-
-
 int main() {
 	
 	int pedal;
-	uint8_t data [3];	// midi data to send
-
-	uint64_t press_on, press_off;				// time for tap tempo function, to enable / disable tap tempo functionality
-	uint64_t this_press, previous_press = 0;	// time for tap tempo function, to measure timing between 1st and 2nd press
-
-#ifndef NOALARM
-	alarm_id_t alarm_id;						// id of alarm used to send MIDI clock at regular intervals
-	bool active_alarm = false;					// indicates whether there is an ongoing alarm
-#endif
 
 	stdio_init_all();
 	board_init();
@@ -308,11 +186,6 @@ int main() {
 	gpio_set_dir(SWITCH_PAUSE, GPIO_IN);
 	gpio_pull_up (SWITCH_PAUSE);		 // switch pull-up
 
-	gpio_init(SWITCH_TEMPO);
-	gpio_set_dir(SWITCH_TEMPO, GPIO_IN);
-	gpio_pull_up (SWITCH_TEMPO);		 // switch pull-up
-
-
 
 	// main loop
 	while (1) {
@@ -322,7 +195,7 @@ int main() {
 		connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
 
 		// test pedal and check if one of them is pressed
-		pedal = test_switch (PREV | NEXT | PLAY | PAUSE | TEMPO);
+		pedal = test_switch (PREV | NEXT | PLAY | PAUSE);
 
 
 		if (pedal & (NEXT | PREV)) {
@@ -331,142 +204,46 @@ int main() {
 				song = (song == 31) ? 0 : song + 1;		// test boundaries
 			if (pedal & PREV)
 				song = (song == 0) ? 31 : song - 1;		// test boundaries
-			data [0] = MIDI_PRG_CHANGE;
-			data [1] = song; 
-			send_midi (data, 2);
+			midi_tx [index_tx++] = MIDI_PRG_CHANGE;
+			midi_tx [index_tx++] = song; 
 		}
 
 
 		if (pedal & PLAY) {
 			// play / stop
 			if (play) {		// if play, then stop
-				data [0] = MIDI_STOP;
+				midi_tx [index_tx++] = MIDI_STOP;
 				play = false;
 			}
 			else {
-				data [0] = MIDI_PLAY;
+				midi_tx [index_tx++] = MIDI_PLAY;
 				play = true;
 			}
-			send_midi (data, 1);
 		}
 
 
 		if (pedal & PAUSE) {
 			// pause
-			data [0] = MIDI_PAUSE;
-			send_midi (data, 1);
+			midi_tx [index_tx++] = MIDI_PAUSE;
 		}
 
 
-		if (pedal & TEMPO) {
-			// Tap tempo functionality
-			
-			// get current time
-			this_press = to_us_since_boot (get_absolute_time());
-			press_on = this_press;
-
-			// In case this is the first time we press the tempo pedal, then previous_press will be 0
-			// otherwise previous_press will have another value
-
-			// calculate time difference between 2 press of tap tempo pedal, and from this calculate corresponding interval between MIDI ticks
-			time_interval_between_ticks = (this_press - previous_press) / NB_TICKS;
-			// in case time between ticks is too short, do not take press into account: do not change alarms, and consider this is the first press of pedal
-			// in case time between ticks is too large, do not take press into account: do not change alarms, and consider this is the first press of pedal
-
-			// in case there have been 2 presses within the correct timing boundaries
-			if ((time_interval_between_ticks <= BPM40_TICKS) && (time_interval_between_ticks >= BPM240_TICKS)) {
-
-#ifdef NOALARM
-				// set new time to send midi_clock
-				time_to_send_next_clock = this_press + time_interval_between_ticks;
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = to_us_since_boot (get_absolute_time()) + time_interval_between_ticks;
-#else
-				// remove current alarm; will do nothing if no alarm exist already
-				if (active_alarm) cancel_alarm (alarm_id);
-
-				// set a new alarm to send MIDI clock for each MIDI tick
-				alarm_id = add_alarm_in_us (time_interval_between_ticks, alarm_callback, NULL, true);
-				if (alarm_id > 0) active_alarm = true;
-				else {
-					active_alarm = false;
-					printf ("could not set alarm\n");
-				}
-#endif
-			}
-
-			// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
-			previous_press = this_press;
-
-			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
-			while (test_switch (PREV | NEXT | PLAY | PAUSE | TEMPO)) {
-				// read MIDI events coming from groovebox and manage accordingly
-				// commented as this may not be necessary
-				// poll_usb_rx ();
-#ifdef NOALARM
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = to_us_since_boot (get_absolute_time()) + time_interval_between_ticks;
-#endif
-
-#ifdef ALARM2
-				if (midi_clock_to_send) send_clock ();
-#endif
-			}
-			// here we could set pedal to 0 as we know no pedal is pressed; however it does not hurt to keep it though
-
-			// if the pedal has been pressed for 2+ seconds, then disable tap tempo functionality
-			// get current time
-			press_off = to_us_since_boot (get_absolute_time());
-			// check whether pedal has been pressed for 3+ seconds in which case we disable the function
-			if (press_off - press_on >= EXIT_FUNCTION) {
-
-#ifdef NOALARM
-				// set unreachable value for time to send next clock signal: nothing will be sent then
-				time_to_send_next_clock = 0xffffffffffffffff;
-#else
-				// remove alarm
-				if (active_alarm) cancel_alarm (alarm_id);
-				active_alarm = false;
-#endif
-
-
-				// set functionality off (this is not really necessary)
-				previous_press = 0;
-			}
+		// if some data is present, send midi data and flush buffer
+		if (index_tx) {
+			send_midi (midi_tx, index_tx);
+			if (connected) tuh_midi_stream_flush(midi_dev_addr);
+			index_tx = 0;
 		}
-
 
 		// check that pedal is released
 		if (pedal) {
-			// if pedal is pressed, then flush send buffer
-			if (connected) tuh_midi_stream_flush(midi_dev_addr);
 			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
-			while (test_switch (PREV | NEXT | PLAY | PAUSE | TEMPO)) {
-				// read MIDI events coming from groovebox and manage accordingly
-				// commented as this may not be necessary
-				// poll_usb_rx ();
-#ifdef NOALARM
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = to_us_since_boot (get_absolute_time()) + time_interval_between_ticks;
-#endif
-
-#ifdef ALARM2
-				if (midi_clock_to_send) send_clock ();
-#endif
-
-			}
+			while (test_switch (PREV | NEXT | PLAY | PAUSE));
 		}
 
-#ifdef NOALARM
-		// send midi clock if required
-		if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = to_us_since_boot (get_absolute_time()) + time_interval_between_ticks;
-#endif
-
-#ifdef ALARM2
-		if (midi_clock_to_send) send_clock ();
-#endif
-
-		// flush outgoing data, and read MIDI events coming from groovebox and manage accordingly
+		// read MIDI events coming from groovebox and manage accordingly
 		if (connected) tuh_midi_stream_flush(midi_dev_addr);
 		poll_usb_rx ();
-		
 	}
 }
 
@@ -510,28 +287,60 @@ void tuh_midi_umount_cb(uint8_t dev_addr, uint8_t instance)
 // invoked when receiving some MIDI data
 void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 {
+	uint8_t cable_num;
+	uint8_t *buffer;
+	uint32_t i;
+	uint32_t bytes_read;
+
+	// set midi_rx as buffer
+	buffer = midi_rx;
+	
 	if (midi_dev_addr == dev_addr)
 	{
 		if (num_packets != 0)
 		{
-			uint8_t cable_num;
-			uint8_t buffer[48];   // 48 should be enough as we only get Program Change data
 			while (1) {
-				uint32_t bytes_read = tuh_midi_stream_read(dev_addr, &cable_num, buffer, sizeof(buffer));
+				bytes_read = tuh_midi_stream_read(dev_addr, &cable_num, buffer, MIDI_BUF_SIZE);
 				if (bytes_read == 0) return;
 				if (cable_num == 0) {
-							// test values received from groovebox via MIDI
-				  // this is a poor way of testing; in some cases, we receive much more than 1 or 2 bytes
-				  // and incoming MIDI message should be parsed
-				  // in the case we only receive Program Change data, this testing should be sufficient
-							if (bytes_read == 1) {		// test MIDI PLAY or STOP
-								if (buffer [0] == MIDI_PLAY) play = true;
-								if (buffer [0] == MIDI_STOP) play = false;
-							}
-						  if (bytes_read == 2) {		// test MIDI PROGRAM CHANGE
-							  if (buffer [0] == MIDI_PRG_CHANGE)
-								  if (buffer [1] <= 31) song = buffer [1];		// make sure song number is inside boudaries (0 to 31)
-						  }
+					i = 0;
+					while (i < bytes_read) {
+						// test values received from groovebox via MIDI
+						switch (buffer [i]) {
+// This part is not needed as e don't receive MIDI CLOCK signals (R-PICO cannot cope with the speed)
+//							case MIDI_CLOCK:
+//								midi_tx [index_tx++] = MIDI_CLOCK;
+//								break;
+							case MIDI_PLAY:
+								play = true;
+								break;
+							case MIDI_STOP:
+								play = false;
+								break;
+							case MIDI_PRG_CHANGE:
+								if (buffer [i+1] <= 31) song = buffer [i+1];		// make sure song number is inside boudaries (0 to 31)
+								break;
+						}
+						switch (buffer [i] & 0xF0) {	// control only MS nibble to increment index in buffer
+							case 0x80:
+							case 0x90:
+							case 0xA0:
+							case 0xB0:
+							case 0xE0:
+								i+=3;
+								break;
+							case 0xC0:
+							case 0xD0:
+								i+=2;
+								break;
+							case 0xF0:
+								i+=1;
+								break;
+							default:
+								i+=1;
+								break;
+						}
+					}
 				}
 			}
 		}
