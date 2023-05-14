@@ -36,6 +36,8 @@
 // receiving clock signal is too resource-consuming for raspi pico
 // START / STOP don't work if raspi does not provide clock signal
 
+// MISSING : CHECK WHETHER DATA IS SENT CORRECTLY AND RECEIVED CORRECTLY
+// ISSUES WITH while LOOPS : WAIT_MS SHOULD BE AVOIDED
 
 #include <stdio.h>
 #include "pico/stdlib.h"
@@ -47,7 +49,7 @@
 #define MIDI_CLOCK		0xF8
 #define MIDI_PLAY		0xFA
 #define MIDI_STOP		0xFC
-#define MIDI_PAUSE		0xFB
+#define MIDI_CONTINUE	0xFB
 #define MIDI_PRG_CHANGE	0xCF	// 0xC0 is program change, 0x0F is midi channel
 
 #define LED_GPIO	25	// onboard led
@@ -64,15 +66,21 @@ const uint NO_LED2_GPIO = 255;
 #define SWITCH_PREV		11		// previous session
 #define SWITCH_NEXT		15		// next session
 #define SWITCH_PLAY		14		// play
-#define SWITCH_PAUSE	12		// pause
+#define SWITCH_CONTINUE	12		// pause
 #define SWITCH_TEMPO	13		// tap tempo
 #define PREV			1
 #define NEXT			2
 #define PLAY			4
-#define PAUSE			8
+#define CONTINUE		8
+#define TEMPO			16
 
 #define FALSE			0
 #define TRUE 			1
+
+#define EXIT_FUNCTION	2000000	// 2000000 usec = 2 sec
+#define NB_TICKS		24		// 24 ticks per beat (quarter note)
+#define	BPM40_TICKS		62500	// 40BPM = 1 beat every 1.5 seconds = 1500000 usec / NB_TICKS = 62500 us between ticks
+#define	BPM240_TICKS	10417	// 240BPM = 1 beat every .250 seconds = 250000 usec / NB_TICKS = 10417 us between ticks
 
 
 // globals
@@ -80,7 +88,15 @@ static uint8_t song = 0;
 static uint8_t midi_dev_addr = 0;
 static bool connected = false;
 static bool play = false;
+static bool pause = false;
 
+// tempo fct
+static int64_t time_interval_between_ticks = 21000;				// time to wait between 2 MIDI clock ticks; initialized to 0.5 sec/24 (120BPM)
+static int64_t new_time_interval_between_ticks = 21000;			// time to wait between 2 MIDI clock ticks; initialized to 0.5 sec/24 (120BPM)
+static uint64_t time_to_send_next_clock = 0xffffffffffffffff;	// time when to sent next midi clock; initialized to end of times
+static uint64_t time_of_last_clock = 0;							// time when the last midi clock was sent
+
+// midi buffers
 #define MIDI_BUF_SIZE	5000
 static uint8_t midi_rx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
 static uint8_t midi_tx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
@@ -113,10 +129,29 @@ void send_midi (uint8_t * buffer, uint32_t lg)
 }
 
 
+// sends a midi clock signal when "when_to_send" time has elapsed, and returns true
+// returns false if not elapsed
+bool send_clock (uint64_t when_to_send)
+{
+	uint64_t time;
+
+	// check whether it is time to send midi clock signal or not
+	time = to_us_since_boot (get_absolute_time());
+	if (time < when_to_send) return false;
+
+	// send MIDI CLOCK signal
+	midi_tx [index_tx++] = MIDI_CLOCK;
+	// set time of last midi clock was sent
+	time_of_last_clock = time;
+	return true;
+}
+
+
 // test switches and return which switch has been pressed (FALSE if none)
 int test_switch (int pedal_to_check)
 {
 	int result = 0;
+	int i;
 	
 	// test if switch has been pressed
 	// in this case, line is down (level 0)
@@ -132,17 +167,24 @@ int test_switch (int pedal_to_check)
 		result |= PLAY;
 	}
 
-	if ((pedal_to_check & PAUSE) && gpio_get (SWITCH_PAUSE)==0) {
-		result |= PAUSE;
+	if ((pedal_to_check & CONTINUE) && gpio_get (SWITCH_CONTINUE)==0) {
+		result |= CONTINUE;
 	}
 
+	if ((pedal_to_check & TEMPO) && gpio_get (SWITCH_TEMPO)==0) {
+		result |= TEMPO;
+	}
 
 	// LED ON if a switch has been pressed
 	if (result) {
 		if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, true);		// if onboard led and if we are within time window, lite LED on
 		if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, true);	// if another led and if we are within time window, lite LED on
-		// anti-bounce of 30ms
-		sleep_ms (30);
+		// anti-bounce of 30ms, but send clock during this time if required
+		for (i = 0; i < 30; i++) {
+			// do not use sleep as it blocks all the background processes
+			busy_wait_ms (1);
+			if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+		}
 		return result;
 	}
 
@@ -156,6 +198,9 @@ int test_switch (int pedal_to_check)
 int main() {
 	
 	int pedal;
+	uint64_t press_on, press_off;				// time for tap tempo function, to enable / disable tap tempo functionality
+	uint64_t this_press, previous_press = 0;	// time for tap tempo function, to measure timing between 1st and 2nd press
+
 
 	stdio_init_all();
 	board_init();
@@ -182,9 +227,13 @@ int main() {
 	gpio_set_dir(SWITCH_PLAY, GPIO_IN);
 	gpio_pull_up (SWITCH_PLAY);		 // switch pull-up
 
-	gpio_init(SWITCH_PAUSE);
-	gpio_set_dir(SWITCH_PAUSE, GPIO_IN);
-	gpio_pull_up (SWITCH_PAUSE);		 // switch pull-up
+	gpio_init(SWITCH_CONTINUE);
+	gpio_set_dir(SWITCH_CONTINUE, GPIO_IN);
+	gpio_pull_up (SWITCH_CONTINUE);		 // switch pull-up
+
+	gpio_init(SWITCH_TEMPO);
+	gpio_set_dir(SWITCH_TEMPO, GPIO_IN);
+	gpio_pull_up (SWITCH_TEMPO);		 // switch pull-up
 
 
 	// main loop
@@ -195,7 +244,7 @@ int main() {
 		connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
 
 		// test pedal and check if one of them is pressed
-		pedal = test_switch (PREV | NEXT | PLAY | PAUSE);
+		pedal = test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO);
 
 
 		if (pedal & (NEXT | PREV)) {
@@ -206,14 +255,19 @@ int main() {
 				song = (song == 0) ? 31 : song - 1;		// test boundaries
 			midi_tx [index_tx++] = MIDI_PRG_CHANGE;
 			midi_tx [index_tx++] = song; 
+
+			// send stop then pause/continue so music don't stop
+			midi_tx [index_tx++] = MIDI_STOP;
+			if (play || pause) midi_tx [index_tx++] = MIDI_PLAY;
 		}
 
 
 		if (pedal & PLAY) {
 			// play / stop
-			if (play) {		// if play, then stop
+			if (play || pause) {		// if play or pause, then stop
 				midi_tx [index_tx++] = MIDI_STOP;
 				play = false;
+				pause = false;
 			}
 			else {
 				midi_tx [index_tx++] = MIDI_PLAY;
@@ -222,9 +276,70 @@ int main() {
 		}
 
 
-		if (pedal & PAUSE) {
-			// pause
-			midi_tx [index_tx++] = MIDI_PAUSE;
+		if (pedal & CONTINUE) {
+			// pause / stop
+			if (play || pause) {		// if pause or play, then stop
+				midi_tx [index_tx++] = MIDI_STOP;
+				play = false;
+				pause = false;
+			}
+			else {
+				midi_tx [index_tx++] = MIDI_CONTINUE;
+				pause = true;
+			}
+		}
+
+		if (pedal & TEMPO) {
+			// Tap tempo functionality
+			
+			// get current time
+			this_press = to_us_since_boot (get_absolute_time());
+			press_on = this_press;
+
+			// In case this is the first time we press the tempo pedal, then previous_press will be 0
+			// otherwise previous_press will have another value
+
+			// calculate time difference between 2 press of tap tempo pedal, and from this calculate corresponding interval between MIDI ticks
+			new_time_interval_between_ticks = (this_press - previous_press) / NB_TICKS;
+			// in case time between ticks is too short, do not take press into account: do not change alarms, and consider this is the first press of pedal
+			// in case time between ticks is too large, do not take press into account: do not change alarms, and consider this is the first press of pedal
+
+			// in case there have been 2 presses within the correct timing boundaries
+			if ((new_time_interval_between_ticks <= BPM40_TICKS) && (new_time_interval_between_ticks >= BPM240_TICKS)) {
+
+				// validate new time interval as time between ticks
+				// goal of having new time interval is that it allows to keep previous time interval in case of 1st press
+				time_interval_between_ticks = new_time_interval_between_ticks;
+				// send stop then pause/continue so music don't stop
+				midi_tx [index_tx++] = MIDI_STOP;
+				if (play || pause) midi_tx [index_tx++] = MIDI_CONTINUE;
+				// set new time to send midi_clock
+				time_to_send_next_clock = this_press + time_interval_between_ticks;
+				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+			}
+
+			// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
+			previous_press = this_press;
+
+			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
+			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
+// useless, this is also done in test_switch
+//				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+			}
+			// here we could set pedal to 0 as we know no pedal is pressed; however it does not hurt to keep it though
+
+			// if the pedal has been pressed for 2+ seconds, then disable tap tempo functionality
+			// get current time
+			press_off = to_us_since_boot (get_absolute_time());
+
+			// check whether pedal has been pressed for 2+ seconds in which case we disable the function
+			if (press_off - press_on >= EXIT_FUNCTION) {
+				// set unreachable value for time to send next clock signal: nothing will be sent then
+				time_to_send_next_clock = 0xffffffffffffffff;
+
+				// set functionality off (this is not really necessary)
+				previous_press = 0;
+			}
 		}
 
 
@@ -238,7 +353,18 @@ int main() {
 		// check that pedal is released
 		if (pedal) {
 			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
-			while (test_switch (PREV | NEXT | PLAY | PAUSE));
+			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
+// useless, this is also done in test_switch
+//				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+			}
+		}
+
+		// send midi clock if required (in particular if no pedal is pressed)
+		if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+		// if some data is present, send midi data and flush buffer
+		if (index_tx) {
+			send_midi (midi_tx, index_tx);
+			index_tx = 0;
 		}
 
 		// read MIDI events coming from groovebox and manage accordingly
@@ -307,21 +433,25 @@ void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 					while (i < bytes_read) {
 						// test values received from groovebox via MIDI
 						switch (buffer [i]) {
-// This part is not needed as e don't receive MIDI CLOCK signals (R-PICO cannot cope with the speed)
+// This part is not needed as we don't receive MIDI CLOCK signals (R-PICO cannot cope with the speed)
 //							case MIDI_CLOCK:
 //								midi_tx [index_tx++] = MIDI_CLOCK;
 //								break;
+							case MIDI_CONTINUE:
+								pause = true;
+								break;
 							case MIDI_PLAY:
 								play = true;
 								break;
 							case MIDI_STOP:
 								play = false;
+								pause = false;
 								break;
 							case MIDI_PRG_CHANGE:
 								if (buffer [i+1] <= 31) song = buffer [i+1];		// make sure song number is inside boudaries (0 to 31)
 								break;
 						}
-						switch (buffer [i] & 0xF0) {	// control only MS nibble to increment index in buffer
+						switch (buffer [i] & 0xF0) {	// control only MS nibble to increment index in buffer; event sorting is approximative, but should be enough
 							case 0x80:
 							case 0x90:
 							case 0xA0:
