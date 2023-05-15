@@ -154,8 +154,8 @@ bool send_clock (uint64_t when_to_send)
 int test_switch (int pedal_to_check)
 {
 	int result = 0;
+	static int previous_result = 0;		// previous value fo result, required for anti-bounce; this MUST BE static
 	int i;
-	static previous_result = 0;		// previous value fo result, required for anti-bounce; this MUST BE static
 	uint64_t time;
 
 	
