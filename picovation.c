@@ -36,8 +36,11 @@
 // receiving clock signal is too resource-consuming for raspi pico
 // START / STOP don't work if raspi does not provide clock signal
 
+////////////////////////////////////////////////////////////////////////
 // MISSING : CHECK WHETHER DATA IS SENT CORRECTLY AND RECEIVED CORRECTLY
-// ISSUES WITH while LOOPS : WAIT_MS SHOULD BE AVOIDED
+////////////////////////////////////////////////////////////////////////
+
+
 
 #include <stdio.h>
 #include "pico/stdlib.h"
@@ -152,6 +155,9 @@ int test_switch (int pedal_to_check)
 {
 	int result = 0;
 	int i;
+	static previous_result = 0;		// previous value fo result, required for anti-bounce; this MUST BE static
+	uint64_t time;
+
 	
 	// test if switch has been pressed
 	// in this case, line is down (level 0)
@@ -175,23 +181,29 @@ int test_switch (int pedal_to_check)
 		result |= TEMPO;
 	}
 
-	// LED ON if a switch has been pressed
-	if (result) {
-		if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, true);		// if onboard led and if we are within time window, lite LED on
-		if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, true);	// if another led and if we are within time window, lite LED on
+	// LED ON or LED OFF depending if a switch has been pressed
+	if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, (result ? true : false));		// if onboard led and if we are within time window, lite LED on/off
+	if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, (result ? true : false));	// if another led and if we are within time window, lite LED on/off
+
+	// check whether there has been a change of state in the pedal (pedal pressed or unpressed...)
+	// this allows to have anti-bouncing when pedal goes from unpressed to pressed, or from pressed to unpressed
+	if (result != previous_result) {
 		// anti-bounce of 30ms, but send clock during this time if required
 		for (i = 0; i < 30; i++) {
-			// do not use sleep as it blocks all the background processes
-			busy_wait_ms (1);
+			// wait 1ms: not sure whether sleep or busy_wait are blocking background threads
+			//
+			//sleep_ms (1)
+			//busy_wait_ms (1);
+			time = to_us_since_boot (get_absolute_time());
+			while (to_us_since_boot (get_absolute_time()) < (time + 1000));	// wait 1ms = 1000us
+			// send midi clock if required
 			if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 		}
-		return result;
 	}
 
-	// no switch pressed : LED off
-	if (NO_LED_GPIO != LED_GPIO) gpio_put(LED_GPIO, false);		// if onboard led and if we are within time window, lite LED on
-	if (NO_LED2_GPIO != LED2_GPIO) gpio_put(LED2_GPIO, false);	// if another led and if we are within time window, lite LED on
-	return FALSE;
+	// copy pedal state and return
+	previous_result = result;
+	return result;
 }
 
 
@@ -289,6 +301,7 @@ int main() {
 			}
 		}
 
+
 		if (pedal & TEMPO) {
 			// Tap tempo functionality
 			
@@ -323,8 +336,7 @@ int main() {
 
 			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
 			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
-// useless, this is also done in test_switch
-//				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 			}
 			// here we could set pedal to 0 as we know no pedal is pressed; however it does not hurt to keep it though
 
@@ -354,8 +366,7 @@ int main() {
 		if (pedal) {
 			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
 			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
-// useless, this is also done in test_switch
-//				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 			}
 		}
 
@@ -451,7 +462,7 @@ void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 								if (buffer [i+1] <= 31) song = buffer [i+1];		// make sure song number is inside boudaries (0 to 31)
 								break;
 						}
-						switch (buffer [i] & 0xF0) {	// control only MS nibble to increment index in buffer; event sorting is approximative, but should be enough
+						switch (buffer [i] & 0xF0) {	// control only most significant nibble to increment index in buffer; event sorting is approximative, but should be enough
 							case 0x80:
 							case 0x90:
 							case 0xA0:
