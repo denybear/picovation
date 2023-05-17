@@ -85,6 +85,12 @@ const uint NO_LED2_GPIO = 255;
 #define	BPM40_TICKS		62500	// 40BPM = 1 beat every 1.5 seconds = 1500000 usec / NB_TICKS = 62500 us between ticks
 #define	BPM240_TICKS	10417	// 240BPM = 1 beat every .250 seconds = 250000 usec / NB_TICKS = 10417 us between ticks
 
+// type definition
+struct pedalboard {
+	int value;				// value of pedal variable at the time of calling the function: describes which pedal is pressed
+	bool change_state;		// describes whether pedal state has changed from last call
+	uint64_t change_time;	// describes time elapsed between previous state change and current state change (ie. between previous press and current press); 0 if no state change
+}
 
 // globals
 static uint8_t song = 0;
@@ -151,14 +157,21 @@ bool send_clock (uint64_t when_to_send)
 
 
 // test switches and return which switch has been pressed (FALSE if none)
-int test_switch (int pedal_to_check)
+int test_switch (int pedal_to_check, struct pedalboard* pedal)
 {
 	int result = 0;
-	static int previous_result = 0;		// previous value fo result, required for anti-bounce; this MUST BE static
+	static int previous_result = 0;							// previous value for result, required for anti-bounce; this MUST BE static
+	static uint64_t this_press, previous_press = 0;			// time between 2 state changes; this MUST be static
 	int i;
-	uint64_t time;
 
-	
+
+	// by default, we assume there is no change in the pedal state (ie. same pedals are pressed / unpressed as for previous function call)
+	pedal->change_state = false;
+
+	// determine for how long we are in the current state
+	this_press = to_us_since_boot (get_absolute_time());
+	pedal->change_time = this_press - previous_press;
+
 	// test if switch has been pressed
 	// in this case, line is down (level 0)
 	if ((pedal_to_check & PREV) && gpio_get (SWITCH_PREV)==0) {
@@ -188,29 +201,29 @@ int test_switch (int pedal_to_check)
 	// check whether there has been a change of state in the pedal (pedal pressed or unpressed...)
 	// this allows to have anti-bouncing when pedal goes from unpressed to pressed, or from pressed to unpressed
 	if (result != previous_result) {
+		// pedal state has changed; set variables accordingly
+		pedal->change_state = true;
+		previous_press = this_press;
+
 		// anti-bounce of 30ms, but send clock during this time if required
 		for (i = 0; i < 30; i++) {
 			// wait 1ms: not sure whether sleep or busy_wait are blocking background threads
-			//
-			//sleep_ms (1)
-			//busy_wait_ms (1);
-			time = to_us_since_boot (get_absolute_time());
-			while (to_us_since_boot (get_absolute_time()) < (time + 1000));	// wait 1ms = 1000us
+			sleep_ms (1)
 			// send midi clock if required
 			if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 		}
 	}
 
-	// copy pedal state and return
+	// copy pedal values and return
 	previous_result = result;
+	pedal->value = result;
 	return result;
 }
 
 
 int main() {
 	
-	int pedal;
-	uint64_t press_on, press_off;				// time for tap tempo function, to enable / disable tap tempo functionality
+	struct pedalboard pedal;
 	uint64_t this_press, previous_press = 0;	// time for tap tempo function, to measure timing between 1st and 2nd press
 
 
@@ -255,122 +268,103 @@ int main() {
 		// check connection to USB slave
 		connected = midi_dev_addr != 0 && tuh_midi_configured(midi_dev_addr);
 
+
 		// test pedal and check if one of them is pressed
-		pedal = test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO);
+		test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO, &pedal);
 
+		// check if state has changed, ie. pedal has just been pressed or unpressed
+		if (pedal->change_state) {
 
-		if (pedal & (NEXT | PREV)) {
-			// previous or next session
-			if (pedal & NEXT)
-				song = (song == 31) ? 0 : song + 1;		// test boundaries
-			if (pedal & PREV)
-				song = (song == 0) ? 31 : song - 1;		// test boundaries
-			midi_tx [index_tx++] = MIDI_PRG_CHANGE;
-			midi_tx [index_tx++] = song; 
+			if (pedal->value & (NEXT | PREV)) {
+				// previous or next session
+				if (pedal & NEXT)
+					song = (song == 31) ? 0 : song + 1;		// test boundaries
+				if (pedal & PREV)
+					song = (song == 0) ? 31 : song - 1;		// test boundaries
+				midi_tx [index_tx++] = MIDI_PRG_CHANGE;
+				midi_tx [index_tx++] = song; 
 
-			// send stop then pause/continue so music don't stop
-			midi_tx [index_tx++] = MIDI_STOP;
-			if (play || pause) midi_tx [index_tx++] = MIDI_PLAY;
-		}
-
-
-		if (pedal & PLAY) {
-			// play / stop
-			if (play || pause) {		// if play or pause, then stop
-				midi_tx [index_tx++] = MIDI_STOP;
-				play = false;
-				pause = false;
-			}
-			else {
-				midi_tx [index_tx++] = MIDI_PLAY;
-				play = true;
-			}
-		}
-
-
-		if (pedal & CONTINUE) {
-			// pause / stop
-			if (play || pause) {		// if pause or play, then stop
-				midi_tx [index_tx++] = MIDI_STOP;
-				play = false;
-				pause = false;
-			}
-			else {
-				midi_tx [index_tx++] = MIDI_CONTINUE;
-				pause = true;
-			}
-		}
-
-
-		if (pedal & TEMPO) {
-			// Tap tempo functionality
-			
-			// get current time
-			this_press = to_us_since_boot (get_absolute_time());
-			press_on = this_press;
-
-			// In case this is the first time we press the tempo pedal, then previous_press will be 0
-			// otherwise previous_press will have another value
-
-			// calculate time difference between 2 press of tap tempo pedal, and from this calculate corresponding interval between MIDI ticks
-			new_time_interval_between_ticks = (this_press - previous_press) / NB_TICKS;
-			// in case time between ticks is too short, do not take press into account: do not change alarms, and consider this is the first press of pedal
-			// in case time between ticks is too large, do not take press into account: do not change alarms, and consider this is the first press of pedal
-
-			// in case there have been 2 presses within the correct timing boundaries
-			if ((new_time_interval_between_ticks <= BPM40_TICKS) && (new_time_interval_between_ticks >= BPM240_TICKS)) {
-
-				// validate new time interval as time between ticks
-				// goal of having new time interval is that it allows to keep previous time interval in case of 1st press
-				time_interval_between_ticks = new_time_interval_between_ticks;
 				// send stop then pause/continue so music don't stop
 				midi_tx [index_tx++] = MIDI_STOP;
-				if (play || pause) midi_tx [index_tx++] = MIDI_CONTINUE;
-				// set new time to send midi_clock
-				time_to_send_next_clock = this_press + time_interval_between_ticks;
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+				if (play || pause) midi_tx [index_tx++] = MIDI_PLAY;
 			}
 
-			// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
-			previous_press = this_press;
 
-			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
-			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+			if (pedal->value & PLAY) {
+				// play / stop
+				if (play || pause) {		// if play or pause, then stop
+					midi_tx [index_tx++] = MIDI_STOP;
+					play = false;
+					pause = false;
+				}
+				else {
+					midi_tx [index_tx++] = MIDI_PLAY;
+					play = true;
+				}
 			}
-			// here we could set pedal to 0 as we know no pedal is pressed; however it does not hurt to keep it though
 
-			// if the pedal has been pressed for 2+ seconds, then disable tap tempo functionality
-			// get current time
-			press_off = to_us_since_boot (get_absolute_time());
 
-			// check whether pedal has been pressed for 2+ seconds in which case we disable the function
-			if (press_off - press_on >= EXIT_FUNCTION) {
-				// set unreachable value for time to send next clock signal: nothing will be sent then
-				time_to_send_next_clock = 0xffffffffffffffff;
+			if (pedal->value & CONTINUE) {
+				// pause / stop
+				if (play || pause) {		// if pause or play, then stop
+					midi_tx [index_tx++] = MIDI_STOP;
+					play = false;
+					pause = false;
+				}
+				else {
+					midi_tx [index_tx++] = MIDI_CONTINUE;
+					pause = true;
+				}
+			}
 
-				// set functionality off (this is not really necessary)
-				previous_press = 0;
+
+			if (pedal->value & TEMPO) {
+				// Tap tempo functionality
+				
+				// get current time
+				this_press = to_us_since_boot (get_absolute_time());
+	
+				// In case this is the first time we press the tempo pedal, then previous_press will be 0
+				// otherwise previous_press will have another value
+	
+				// calculate time difference between 2 press of tap tempo pedal, and from this calculate corresponding interval between MIDI ticks
+				new_time_interval_between_ticks = (this_press - previous_press) / NB_TICKS;
+				// in case time between ticks is too short, do not take press into account: do not change alarms, and consider this is the first press of pedal
+				// in case time between ticks is too large, do not take press into account: do not change alarms, and consider this is the first press of pedal
+	
+				// in case there have been 2 presses within the correct timing boundaries
+				if ((new_time_interval_between_ticks <= BPM40_TICKS) && (new_time_interval_between_ticks >= BPM240_TICKS)) {
+	
+					// validate new time interval as time between ticks
+					// goal of having new time interval is that it allows to keep previous time interval in case of 1st press
+					time_interval_between_ticks = new_time_interval_between_ticks;
+					// send stop then pause/continue so music don't stop
+					midi_tx [index_tx++] = MIDI_STOP;
+					if (play || pause) midi_tx [index_tx++] = MIDI_CONTINUE;
+					// set new time to send midi_clock
+					time_to_send_next_clock = this_press + time_interval_between_ticks;
+					if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
+				}
+	
+				// in any case, current time (time of this press) becomes time of previous press, in order to prepare for next press
+				previous_press = this_press;
+			}
+
+			if (pedal->value == 0) {
+				// no pedal pressed anymore
+				// check how much time the previous pedal was pressed; if more than 2 sec, then disable the tap tempo fonctionality
+				if (pedal->change_time >= EXIT_FUNCTION)
+					// set unreachable value for time to send next clock signal: nothing will be sent then
+					time_to_send_next_clock = 0xffffffffffffffff;
+	
+					// set functionality off (this is not really necessary)
+					previous_press = 0;
+				}
 			}
 		}
 
 
-		// if some data is present, send midi data and flush buffer
-		if (index_tx) {
-			send_midi (midi_tx, index_tx);
-			if (connected) tuh_midi_stream_flush(midi_dev_addr);
-			index_tx = 0;
-		}
-
-		// check that pedal is released
-		if (pedal) {
-			// wait for pedal to be unpressed; during that time, make sure we receive incoming midi events though
-			while (test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO)) {
-				if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
-			}
-		}
-
-		// send midi clock if required (in particular if no pedal is pressed)
+		// send midi clock if required
 		if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 		// if some data is present, send midi data and flush buffer
 		if (index_tx) {
