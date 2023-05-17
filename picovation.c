@@ -89,8 +89,9 @@ const uint NO_LED2_GPIO = 255;
 struct pedalboard {
 	int value;				// value of pedal variable at the time of calling the function: describes which pedal is pressed
 	bool change_state;		// describes whether pedal state has changed from last call
+	int change_value;		// describes pedal value when state is changed
 	uint64_t change_time;	// describes time elapsed between previous state change and current state change (ie. between previous press and current press); 0 if no state change
-}
+};
 
 // globals
 static uint8_t song = 0;
@@ -203,12 +204,13 @@ int test_switch (int pedal_to_check, struct pedalboard* pedal)
 	if (result != previous_result) {
 		// pedal state has changed; set variables accordingly
 		pedal->change_state = true;
+		pedal->change_value = previous_result;
 		previous_press = this_press;
 
 		// anti-bounce of 30ms, but send clock during this time if required
 		for (i = 0; i < 30; i++) {
 			// wait 1ms: not sure whether sleep or busy_wait are blocking background threads
-			sleep_ms (1)
+			sleep_ms (1);
 			// send midi clock if required
 			if (send_clock (time_to_send_next_clock)) time_to_send_next_clock = time_of_last_clock + time_interval_between_ticks;
 		}
@@ -260,6 +262,12 @@ int main() {
 	gpio_set_dir(SWITCH_TEMPO, GPIO_IN);
 	gpio_pull_up (SWITCH_TEMPO);		 // switch pull-up
 
+	// init pedal structure to all 0
+	pedal.value = 0;
+	pedal.change_state = false;
+	pedal.change_value = 0;
+	pedal.change_time = 0;
+
 
 	// main loop
 	while (1) {
@@ -273,13 +281,13 @@ int main() {
 		test_switch (PREV | NEXT | PLAY | CONTINUE | TEMPO, &pedal);
 
 		// check if state has changed, ie. pedal has just been pressed or unpressed
-		if (pedal->change_state) {
+		if (pedal.change_state) {
 
-			if (pedal->value & (NEXT | PREV)) {
+			if (pedal.value & (NEXT | PREV)) {
 				// previous or next session
-				if (pedal & NEXT)
+				if (pedal.value & NEXT)
 					song = (song == 31) ? 0 : song + 1;		// test boundaries
-				if (pedal & PREV)
+				if (pedal.value & PREV)
 					song = (song == 0) ? 31 : song - 1;		// test boundaries
 				midi_tx [index_tx++] = MIDI_PRG_CHANGE;
 				midi_tx [index_tx++] = song; 
@@ -290,7 +298,7 @@ int main() {
 			}
 
 
-			if (pedal->value & PLAY) {
+			if (pedal.value & PLAY) {
 				// play / stop
 				if (play || pause) {		// if play or pause, then stop
 					midi_tx [index_tx++] = MIDI_STOP;
@@ -304,7 +312,7 @@ int main() {
 			}
 
 
-			if (pedal->value & CONTINUE) {
+			if (pedal.value & CONTINUE) {
 				// pause / stop
 				if (play || pause) {		// if pause or play, then stop
 					midi_tx [index_tx++] = MIDI_STOP;
@@ -318,7 +326,7 @@ int main() {
 			}
 
 
-			if (pedal->value & TEMPO) {
+			if (pedal.value & TEMPO) {
 				// Tap tempo functionality
 				
 				// get current time
@@ -350,10 +358,10 @@ int main() {
 				previous_press = this_press;
 			}
 
-			if (pedal->value == 0) {
-				// no pedal pressed anymore
+			if ((pedal.value == 0) && (pedal.change_value & TEMPO)) {
+				// no pedal pressed anymore and pedal previously pressed was TEMPO
 				// check how much time the previous pedal was pressed; if more than 2 sec, then disable the tap tempo fonctionality
-				if (pedal->change_time >= EXIT_FUNCTION)
+				if (pedal.change_time >= EXIT_FUNCTION) {
 					// set unreachable value for time to send next clock signal: nothing will be sent then
 					time_to_send_next_clock = 0xffffffffffffffff;
 	
