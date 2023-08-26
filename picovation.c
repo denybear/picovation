@@ -26,27 +26,12 @@
  * 
  */
 
-// Groovebox shall be setup with (press shift while powering the Novation circuit) :
-// notes RX and TX : off
-// CC RX and TX : off
-// PC RX and TX : on
-// Clock RX : on, Clock TX : off
-// Lights on the Novation circuit : 00 00 11 10
-//
-// receiving clock signal is too resource-consuming for raspi pico
-// START / STOP don't work if raspi does not provide clock signal
-
-////////////////////////////////////////////////////////////////////////
-// MISSING : CHECK WHETHER DATA IS SENT CORRECTLY AND RECEIVED CORRECTLY
-////////////////////////////////////////////////////////////////////////
-
-
-
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
-#include "bsp/board.h"
+#include "bsp/board_api.h"
 #include "tusb.h"
+#include "usb_midi_host.h"
 
 // constants
 #define MIDI_CLOCK		0xF8
@@ -111,17 +96,6 @@ static uint64_t time_of_last_clock = 0;							// time when the last midi clock w
 static uint8_t midi_rx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
 static uint8_t midi_tx [MIDI_BUF_SIZE];		// large midi buffer to avoid override when receiving midi
 static int index_tx = 0;
-
-// poll USB receive and process received bytes accordingly
-void poll_usb_rx ()
-{
-	// device must be attached and have at least one endpoint ready to receive a message
-	if (!connected || tuh_midih_get_num_rx_cables(midi_dev_addr) < 1)
-	{
-		return;
-	}
-	tuh_midi_read_poll(midi_dev_addr);
-}
 
 
 // write lg bytes stored in buffer to midi out
@@ -382,7 +356,6 @@ int main() {
 
 		// read MIDI events coming from groovebox and manage accordingly
 		if (connected) tuh_midi_stream_flush(midi_dev_addr);
-		poll_usb_rx ();
 	}
 }
 
@@ -446,10 +419,9 @@ void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
 					while (i < bytes_read) {
 						// test values received from groovebox via MIDI
 						switch (buffer [i]) {
-// This part is not needed as we don't receive MIDI CLOCK signals (R-PICO cannot cope with the speed)
+// This part is not needed as when we receive MIDI CLOCK signals from Novation Circuit, we cannot resend them
+// to the Novation Circuit device
 //							case MIDI_CLOCK:
-//								midi_tx [index_tx++] = MIDI_CLOCK;
-//								break;
 							case MIDI_CONTINUE:
 								pause = true;
 								break;
